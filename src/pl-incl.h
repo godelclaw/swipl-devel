@@ -1053,6 +1053,7 @@ typedef enum
 #define	ALERT_BUFFER	     0x100
 #define	ALERT_UNDO	     0x200
 #define ALERT_COVERAGE	     0x400
+#define ALERT_GENERATION     0x800	/* see stampSnapshotFrame() */
 
 
 		 /*******************************
@@ -2113,6 +2114,7 @@ struct queryFrame
   LocalFrame	saved_ltop;		/* Saved lTop */
   QueryFrame	parent;			/* Parent queryFrame */
   QueryRef	qid;			/* Opaque query id */
+  size_t	snapshot_call;		/* See stampSnapshotFrame() */
   struct choice	choice WORD_ALIGNED;	/* First (dummy) choice-point */
   LocalFrame	saved_environment;	/* Parent local-frame */
 					/* Do not put anything between */

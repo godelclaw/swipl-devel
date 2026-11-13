@@ -87,6 +87,7 @@
             transaction/3,                      % :Goal, :Constraint, +Mutex
             snapshot/1,                         % :Goal
             db_snapshot_scope/2,                % -Snapshot, :Goal
+            db_snapshot_call/2,                 % +Snapshot, :Goal
             undo/1,                             % :Goal
             set_prolog_gc_thread/1,		% +Status
 
@@ -101,6 +102,7 @@
     transaction(0,0,+),
     snapshot(0),
     db_snapshot_scope(-, 0),
+    db_snapshot_call(+, 0),
     rule(:, -),
     rule(:, -, ?),
     sig_block(:),
@@ -1704,6 +1706,20 @@ db_snapshot_scope(Snapshot, Goal) :-
     '$db_snapshot_scope'(Snapshot),
     call(Goal),
     integer(Snapshot).
+
+%!  db_snapshot_call(+Snapshot, :Goal) is nondet.
+%
+%   Call the dynamic predicate Goal on the clauses that were visible
+%   when Snapshot was created.  The goal of '$db_snapshot_goal'/2 must
+%   be followed by the call.  The call port of Goal reads Snapshot from
+%   this frame.  The final nonvar/1 keeps it there: stack GC may clear
+%   an argument that no later goal uses, and a signal can start one at
+%   the call port of the helper.
+
+db_snapshot_call(Snapshot, Goal) :-
+    '$db_snapshot_goal'(Snapshot, Goal),
+    Goal,
+    nonvar(Snapshot).
 
 
 		 /*******************************

@@ -39,6 +39,7 @@
 #include "pl-transaction.h"
 #include "pl-event.h"
 #include "pl-dbref.h"
+#include "pl-comp.h"
 #include "pl-tabling.h"
 #include "pl-proc.h"
 #include "pl-util.h"
@@ -911,10 +912,11 @@ the frame, which the final integer/1 keeps alive.  Snapshot is valid while
 the frame of db_snapshot_scope/2 with this number is an ancestor of the
 frame that uses it, see scope_generation().  Clause GC keeps, for all
 predicates, the clauses visible in the generation of every frame flagged
-FR_SNAPSHOT.  The generation is read and the frame is flagged while
-holding the scan lock of the thread, which clause GC holds while it
-scans the frames of a thread, so a clause GC either sees the flag or the
-generation is not older than the start of this clause GC.
+FR_SNAPSHOT: the frames of db_snapshot_scope/2 and the frames that run a
+goal of db_snapshot_call/2.  The generation is read and the frame is
+flagged while holding the scan lock of the thread, which clause GC holds
+while it scans the frames of a thread, so a clause GC either sees the
+flag or the generation is not older than the start of this clause GC.
 
 A snapshot that is created inside a transaction is the database as this
 transaction sees it at that time.  It also holds the generation of the
@@ -933,6 +935,51 @@ also closes these snapshots before it calls its constraint, as it then
 moves the start of the transaction to the current generation.  See
 closeTransactionSnapshots().  A snapshot of db_snapshot_scope/2 is gone
 before that: its frame ends with the goal of the transaction.
+
+db_snapshot_call/2 calls a dynamic predicate in a snapshot.  It is
+defined as
+
+    db_snapshot_call(Snapshot, Goal) :-
+	'$db_snapshot_goal'(Snapshot, Goal),
+	Goal,
+	nonvar(Snapshot).
+
+'$db_snapshot_goal'/2 checks Goal, records its caller, the frame of
+db_snapshot_call/2, in the current query and raises ALERT_GENERATION.
+The next call port of this query, which is the one of the frame that is
+created for Goal, calls stampSnapshotFrame().  This reads Snapshot from
+the first argument of the caller and gives the frame of Goal the
+generation of the snapshot or raises the error for Snapshot.  No other
+place holds this generation: until the frame has it, the open snapshot
+or the frame of db_snapshot_scope/2 does.  The final nonvar/1 keeps the
+argument alive: stack GC may clear an argument that no later goal uses,
+and a signal can start a GC at the call port of the helper.  As for any
+frame, this generation selects the clauses on the first call and on
+backtracking.  Goals called by a clause get their generation as usual.
+There is no test in the call port if no alert is raised.
+
+The request belongs to the query.  Code that runs between the helper
+and the call port of Goal, i.e., a debugger hook at the exit of the
+helper, runs in a nested query, which starts without a request and
+cannot take the request of its caller.  If the debugger makes the
+helper fail or raises an exception, the next call port of the query is
+not the one of Goal, and the request is dropped.  If such a hook closes
+the snapshot, the call port of Goal raises the existence error.
+
+The frame of Goal must be the frame that selects its clauses.  The
+helper refuses the goals that the meta-call compiles into a clause of
+their own, control structures and call/N with N > 8, as these run in
+other frames.  As a hook or another thread may change the predicate
+after the helper checked it, the call port checks again that it is
+dynamic.  A wrapper (wrap_predicate/4, tabling) calls the wrapped
+predicate in a frame of its own; its supervisor raises an error for a
+frame that has a snapshot, as a wrapper may be added until the frame
+runs its supervisor.
+
+The frame keeps its generation where the call port would set it again
+(refreshGenerationFrame(), keep_generation_continue), also if the
+debugger retries the goal, so the generation never leaves a frame
+flagged FR_SNAPSHOT.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 typedef struct db_snapshot
@@ -1111,10 +1158,12 @@ snapshot_generation(DECL_LD word w, Definition def, gen_t *gen)
   return false;
 }
 
-/* Raise the error for `t` if snapshot_generation() is false for it */
+/* Raise the error for `t` if snapshot_generation() is false for it, for
+ * the predicate `pred`/`arity` or, if `pred` is NULL, the current one.
+ */
 
 static bool
-db_snapshot_error(term_t t)
+db_snapshot_error(term_t t, const char *pred, size_t arity)
 { GET_LD
   atom_t type = PL_new_atom("db_snapshot");
   Word p = valTermRef(t);
@@ -1125,11 +1174,11 @@ db_snapshot_error(term_t t)
   if ( isAtom(*p) && (a=atomValue(*p))->type != &db_snapshot_blob )
     a = NULL;
   if ( a && ((db_snapshot *)a->name)->owner != SNAPSHOT_OWNER() )
-    rc = PL_error(NULL, 0, NULL, ERR_PERMISSION, ATOM_access, type, t);
+    rc = PL_error(pred, arity, NULL, ERR_PERMISSION, ATOM_access, type, t);
   else if ( a || isInteger(*p) )	/* closed or no such scope */
-    rc = PL_error(NULL, 0, NULL, ERR_EXISTENCE, type, t);
+    rc = PL_error(pred, arity, NULL, ERR_EXISTENCE, type, t);
   else
-    rc = PL_error(NULL, 0, NULL, ERR_TYPE, type, t);
+    rc = PL_error(pred, arity, NULL, ERR_TYPE, type, t);
   PL_unregister_atom(type);
 
   return rc;
@@ -1145,7 +1194,7 @@ get_db_snapshot_generation(term_t t, Definition def, gen_t *gen)
   Word p = valTermRef(t);
 
   deRef(p);
-  return snapshot_generation(*p, def, gen) || db_snapshot_error(t);
+  return snapshot_generation(*p, def, gen) || db_snapshot_error(t, NULL, 0);
 }
 
 /* Called by clause GC after it reset the predicates in `ddis`: all
@@ -1213,6 +1262,102 @@ markSnapshotGenerations(TablePP ddis, Buffer gens)
 	ddi_add_access_gen(ddi, g[i]);
     }
   }
+}
+
+/* Called from the call port if ALERT_GENERATION is raised.  The call
+ * port takes the request of its query, see above.  `fr` is the frame of
+ * Goal if its parent is the frame of db_snapshot_call/2 that made the
+ * request, unless it is the helper, which the debugger may retry.  If
+ * the debugger made the helper fail, another frame may since occupy the
+ * place of the caller.  Every frame is created by a call port, which
+ * takes the request, except the one of a goal that the meta-call
+ * compiles, which is not one of db_snapshot_call/2.  The predicate is
+ * checked again here, where the frame gets its generation: after the
+ * helper checked it, another thread or a debugger hook may have made it
+ * static.  False if the predicate of Goal is not dynamic or the
+ * snapshot can no longer be used.  A wrapper that is installed after
+ * this is refused by its supervisor, see snapshotWrapperError().  Does
+ * not allocate.
+ */
+
+bool
+stampSnapshotFrame(DECL_LD LocalFrame fr)
+{ QueryFrame qf = LD->query;
+  bool rc = true;
+
+  if ( qf->snapshot_call )
+  { LocalFrame caller = addPointer(lBase, qf->snapshot_call);
+
+    qf->snapshot_call = 0;
+    if ( fr->parent == caller &&
+	 caller->predicate == GD->procedures.db_snapshot_call2->definition &&
+	 fr->predicate != GD->procedures.db_snapshot_goal2->definition )
+    { Word p = argFrameP(caller, 0);
+      gen_t gen;
+
+      deRef(p);
+      if ( isoff(fr->predicate, P_DYNAMIC) )
+      { rc = false;
+      } else if ( (rc=snapshot_generation(*p, fr->predicate, &gen)) &&
+		  gen != GEN_INVALID )
+      { setGenerationFrameVal(fr, gen);
+	set(fr, FR_SNAPSHOT);		/* see refreshGenerationFrame() */
+      }
+    }
+  }
+  ATOMIC_AND(&LD->alerted, ~ALERT_GENERATION);
+
+  return rc;
+}
+
+/* Raise the permission error of db_snapshot_call/2 for `def`, the
+ * predicate of its goal.
+ */
+
+static void
+snapshot_permission_error(Definition def, const char *type)
+{ GET_LD
+  fid_t fid;
+
+  if ( (fid=PL_open_foreign_frame()) )
+  { term_t pi = PL_new_term_ref();
+    atom_t a = PL_new_atom(type);
+
+    if ( unify_definition(MODULE_user, pi, def, 0,
+			  GP_NAMEARITY|GP_HIDESYSTEM) )
+      PL_error("db_snapshot_call", 2, NULL, ERR_PERMISSION,
+	       ATOM_access, a, pi);
+    PL_unregister_atom(a);
+    PL_close_foreign_frame(fid);
+  }
+}
+
+/* Raise the error if stampSnapshotFrame() returned false, i.e., the
+ * predicate of the goal is not dynamic or the first argument of
+ * db_snapshot_call/2 is not a snapshot this goal can use.
+ */
+
+void
+snapshotFrameError(DECL_LD LocalFrame fr)
+{ if ( isoff(fr->predicate, P_DYNAMIC) )
+  { snapshot_permission_error(fr->predicate, "private_procedure");
+  } else
+  { db_snapshot_error(pushWordAsTermRef(argFrameP(fr->parent, 0)),
+		      "db_snapshot_call", 2);
+    popTermRef();
+  }
+}
+
+/* Called by the supervisor of a wrapper (wrap_predicate/4, tabling) for
+ * a frame that stampSnapshotFrame() gave a snapshot.  The wrapper calls
+ * the wrapped predicate in a frame of its own, which would read the
+ * current database.  The check is here because a wrapper can be added
+ * at any time before this frame runs its supervisor.
+ */
+
+void
+snapshotWrapperError(LocalFrame fr)
+{ snapshot_permission_error(fr->predicate, "wrapped_procedure");
 }
 
 #define new_db_snapshot(_) LDFUNC(new_db_snapshot, _)
@@ -1319,10 +1464,89 @@ PRED_IMPL("db_snapshot_close", 1, db_snapshot_close, 0)
   return true;
 }
 
+/* True if the meta-call compiles a goal with this functor into a clause
+ * of its own, see i_metacall_common.
+ */
+
+static bool
+meta_compiled(FunctorDef fd)
+{ return ison(fd, CONTROL_F) || (fd->name == ATOM_call && fd->arity > 8);
+}
+
+static bool
+meta_compiled_error(FunctorDef fd)
+{ GET_LD
+  term_t pi = PL_new_term_ref();
+
+  return ( pi &&
+	   PL_unify_term(pi, PL_FUNCTOR, FUNCTOR_divide2,
+			       PL_ATOM, fd->name,
+			       PL_INT, (int)fd->arity) &&
+	   PL_error("db_snapshot_call", 2, NULL, ERR_PERMISSION,
+		    ATOM_access, ATOM_private_procedure, pi) );
+}
+
+/** '$db_snapshot_goal'(+Snapshot, :Goal) is semidet.
+ *
+ *  Prepare for calling Goal in Snapshot, see above.  Only called by
+ *  db_snapshot_call/2, whose first argument is read by the call port of
+ *  Goal, which also raises the errors for it.  Fails if Goal has no
+ *  definition.  The meta-call compiles a control structure and call/N
+ *  with N > 8 into a temporary clause (see i_metacall_common), so their
+ *  goals do not run in the frame that the call port of Goal stamps.
+ *  These are refused by their functor, as call/2 ... call/8 are, also
+ *  if the module defines a dynamic predicate with this name and arity.
+ *  A wrapped predicate is refused by the supervisor of the wrapper, see
+ *  snapshotWrapperError().
+ */
+
+static
+PRED_IMPL("$db_snapshot_goal", 2, db_snapshot_goal, PL_FA_TRANSPARENT)
+{ PRED_LD
+  LocalFrame caller = environment_frame->parent;
+  Procedure call2 = _PL_predicate("db_snapshot_call", 2, "$syspreds",
+				  &GD->procedures.db_snapshot_call2);
+  gen_t gen;
+  Procedure proc;
+  Definition def;
+  term_t head = PL_new_term_ref();
+  functor_t f;
+
+  if ( caller->predicate != call2->definition )
+    return PL_permission_error("call", "db_snapshot_call", A1);
+  if ( !get_procedure(A2, &proc, head, GP_FIND) )
+  { Word p = valTermRef(A1);		/* errors on Snapshot */
+
+    if ( PL_get_functor(head, &f) && meta_compiled(valueFunctor(f)) )
+      return meta_compiled_error(valueFunctor(f));
+    deRef(p);
+    if ( !snapshot_generation(*p, NULL, &gen) )
+      db_snapshot_error(A1, "db_snapshot_call", 2);
+    return false;
+  }
+  def = getProcDefinition(proc);
+  if ( meta_compiled(def->functor) )
+    return meta_compiled_error(def->functor);
+  if ( isoff(def, P_DYNAMIC) )
+  { if ( isDefinedProcedure(proc) )
+      return PL_error("db_snapshot_call", 2, NULL, ERR_PERMISSION_PROC,
+		      ATOM_access, ATOM_private_procedure, proc);
+    return false;
+  }
+
+  _PL_predicate("$db_snapshot_goal", 2, "system", /* see stampSnapshotFrame() */
+		&GD->procedures.db_snapshot_goal2);
+  LD->query->snapshot_call = (char*)caller - (char*)lBase;
+  ATOMIC_OR(&LD->alerted, ALERT_GENERATION); /* see updateAlerted() */
+
+  return true;
+}
+
 BeginPredDefs(transaction)
   PRED_DEF("db_snapshot",         1, db_snapshot,         0)
   PRED_DEF("$db_snapshot_scope",  1, db_snapshot_scope,   0)
   PRED_DEF("db_snapshot_close",   1, db_snapshot_close,   0)
+  PRED_DEF("$db_snapshot_goal",   2, db_snapshot_goal,    META)
   PRED_DEF("$transaction",        2, transaction,         META)
   PRED_DEF("$transaction",        3, transaction,         META)
   PRED_DEF("$snapshot",           1, snapshot,            META)

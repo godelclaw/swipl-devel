@@ -51,6 +51,8 @@
 #define	transaction_assert_clause(clause, where)	LDFUNC(transaction_assert_clause, clause, where)
 #define	transaction_visible_clause(cl, gen)		LDFUNC(transaction_visible_clause, cl, gen)
 #define	transaction_last_modified_predicate(def)	LDFUNC(transaction_last_modified_predicate, def)
+#define stampSnapshotFrame(fr)	LDFUNC(stampSnapshotFrame, fr)
+#define snapshotFrameError(fr)	LDFUNC(snapshotFrameError, fr)
 #endif /*USE_LD_MACROS*/
 
 #define LDFUNC_DECLARATIONS
@@ -62,6 +64,9 @@ bool	get_db_snapshot_generation(term_t t, Definition def, gen_t *gen);
 void	markDBSnapshots(TablePP ddis);
 void	addSnapshotGeneration(Buffer gens, gen_t gen);
 void	markSnapshotGenerations(TablePP ddis, Buffer gens);
+bool	stampSnapshotFrame(LocalFrame fr);
+void	snapshotFrameError(LocalFrame fr);
+void	snapshotWrapperError(LocalFrame fr);
 gen_t	transaction_last_modified_predicate(Definition def);
 void	transaction_set_last_modified(Definition def,
 				      gen_t gen, int flags);

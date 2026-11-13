@@ -6541,6 +6541,13 @@ frame, a clause that is erased after the  frame got its generation may
 be reclaimed before the frame selects  its   clauses.  So, we also scan
 for a frame at lTop.  Stale frames above  lTop can only make us keep
 clauses longer.  There is always LOCAL_MARGIN space above lTop.
+
+(**) db_snapshot_call/2 gives the frame of its goal, flagged FR_SNAPSHOT,
+the generation of an open snapshot of db_snapshot/1, after which the
+snapshot may be closed.  Clause GC marks the open snapshots before the
+frames: if it misses a snapshot, the snapshot was closed after the
+frame was given its generation, and the lock of the list of snapshots
+(L_MISC) makes this visible to the scan of the frames.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 void

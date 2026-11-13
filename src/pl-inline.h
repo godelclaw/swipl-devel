@@ -845,6 +845,19 @@ setGenerationFrame(DECL_LD LocalFrame fr)
   }
 }
 
+/* Set the generation of a frame again after its call port ran code that
+ * may have changed the database or after its predicate was resolved.
+ * A frame that was given the generation of a database snapshot by
+ * db_snapshot_call/2 keeps this.
+ */
+
+#define refreshGenerationFrame(fr) LDFUNC(refreshGenerationFrame, fr)
+static inline void
+refreshGenerationFrame(DECL_LD LocalFrame fr)
+{ if ( likely(isoff(fr, FR_SNAPSHOT)) )
+    setGenerationFrame(fr);
+}
+
 static inline QueryFrame
 QueryFromQid(QueryRef qid)
 { return (QueryFrame) (&((Word)qid->engine->stacks.local.base)[qid->offset]);

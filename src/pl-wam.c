@@ -243,6 +243,7 @@ updateAlerted(PL_local_data_t *ld)
 #endif
     if ( ld->fli.string_buffers.top )		mask |= ALERT_BUFFER;
     if ( UNDO_SCHEDULED(ld) )			mask |= ALERT_UNDO;
+    if ( ld->query && ld->query->snapshot_call ) mask |= ALERT_GENERATION;
     if ( ld->coverage.active )			mask |= ALERT_COVERAGE;
   } while ( !COMPARE_AND_SWAP_INT(&ld->alerted, old, mask) );
 }
@@ -3122,6 +3123,7 @@ PL_open_query(Module ctx, int flags, Procedure proc, term_t args)
   qf->yield.wstate.fid  = 0;
   qf->registers.fr      = NULL;		/* invalid */
   qf->next_environment  = NULL;		/* see D_BREAK */
+  qf->snapshot_call     = 0;		/* see stampSnapshotFrame() */
 					/* fill frame arguments */
   ap = argFrameP(fr, 0);
   IS_WORD_ALIGNED(ap);

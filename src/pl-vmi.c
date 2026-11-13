@@ -424,7 +424,7 @@ VMH(retry, 0, (), ())
     clearLocal(FR, FR_SKIPPED);
     exception_term = 0;
 
-    VMH_GOTO(depart_or_retry_continue);
+    VMH_GOTO(retry_continue);
   } else
   { Sdprintf("[Could not find retry-point]\n");
     SAVE_REGISTERS(QID);
@@ -1957,9 +1957,29 @@ VMH(normal_call_grow, 0, (), ())
 }
 END_VMH
 
+VMH(retry_continue, 0, (), ())
+{ if ( unlikely(ison(FR, FR_SNAPSHOT)) ) /* the debugger retries a goal */
+    VMH_GOTO(keep_generation_continue);	/* in its snapshot */
+
+  VMH_GOTO(depart_or_retry_continue);
+}
+END_VMH
+
 VMH(depart_or_retry_continue, 0, (), ())
+{ setGenerationFrame(FR);
+  VMH_GOTO(keep_generation_continue);
+}
+END_VMH
+
+/* Continue a call or retry with the generation that FR has, i.e.,
+ * without setGenerationFrame().  Clause GC sees FR, also if it is
+ * at lTop, see markPredicatesInEnvironments().  Used where FR may
+ * have been given the generation of a snapshot, see
+ * refreshGenerationFrame().
+ */
+
+VMH(keep_generation_continue, 0, (), ())
 {
-  setGenerationFrame(FR);
 #ifdef O_PROFILE
   FR->prof_node = NULL;
 #endif
@@ -1987,6 +2007,14 @@ VMH(depart_alerted, 0, (), ())
   lTop = (LocalFrame) argFrameP(FR, DEF->functor->arity);
   PC = DEF->codes;
 
+  if ( unlikely(LD->alerted & ALERT_GENERATION) && /* db_snapshot_call/2 */
+       !stampSnapshotFrame(FR) )
+  { SAVE_REGISTERS(QID);
+    snapshotFrameError(FR);
+    LOAD_REGISTERS(QID);
+    THROW_EXCEPTION;
+  }
+
 				      /* we need the autoloader and get back */
   if ( DEF->codes[0] == encode(S_VIRGIN) &&
        !DEF->impl.any.defined && isoff(DEF, PROC_DEFINED) )
@@ -2000,7 +2028,7 @@ VMH(depart_alerted, 0, (), ())
     LOAD_REGISTERS(QID);
     if ( FR->predicate != DEF )		/* auto imported/loaded */
     { setFramePredicate(FR, DEF);
-      setGenerationFrame(FR);
+      refreshGenerationFrame(FR);
     }
     if ( isoff(DEF, P_SIG_ATOMIC) )
     { SAVE_REGISTERS(QID);
@@ -2028,7 +2056,7 @@ VMH(depart_alerted, 0, (), ())
     LOAD_REGISTERS(QID);
     if ( !rc )
       THROW_EXCEPTION;
-    setGenerationFrame(FR);	/* see the database as the undo left it */
+    refreshGenerationFrame(FR);	/* see the database as the undo left it */
   }
 
   Profile(FR->prof_node = profCall(DEF));
@@ -2070,12 +2098,12 @@ VMH(depart_alerted, 0, (), ())
     LOAD_REGISTERS(QID);
     if ( FR->predicate != DEF )		/* auto imported/loaded */
     { setFramePredicate(FR, DEF);
-      setGenerationFrame(FR);
+      refreshGenerationFrame(FR);
 #ifdef O_PROFILE
       if ( FR->prof_node )
 	profSetHandle(FR->prof_node, DEF);
 #endif
-      VMH_GOTO(depart_or_retry_continue);
+      VMH_GOTO(keep_generation_continue);
     }
     setLocal(FR, FR_INBOX);
 
@@ -2627,7 +2655,7 @@ VMI(I_LCALL, 0, 1, (CA1_LPROC))
   if ( ison(DEF, P_TRANSPARENT) )
   { FR->context = ctx0;
     FR->level++;
-    clearLocal(FR, FR_CLEAR_NEXT);
+    clearLocal(FR, FR_CLEAR_NEXT|FR_SNAPSHOT);
     setLocal(FR, FR_CONTEXT);
   } else
   { lcoSetNextFrameFlags(FR);
@@ -3377,18 +3405,18 @@ VMI(S_VIRGIN, 0, 0, ())
     LOAD_REGISTERS(QID);
 
     setFramePredicate(FR, DEF);
-    setGenerationFrame(FR);
+    refreshGenerationFrame(FR);
 #ifdef O_PROFILE
     if ( FR->prof_node )
       profSetHandle(FR->prof_node, DEF);
 #endif
     if ( DEF->impl.any.defined )
-      VMH_GOTO(depart_or_retry_continue);
+      VMH_GOTO(keep_generation_continue);
 #ifdef O_PLMT
   } else if ( ison(DEF, P_THREAD_LOCAL) )
   { DEF = getLocalProcDefinition(DEF);
     setFramePredicate(FR, DEF);
-    setGenerationFrame(FR);
+    refreshGenerationFrame(FR);
 #endif
   }
 
@@ -3565,7 +3593,7 @@ S_THREAD_LOCAL: Get thread-local definition
 VMI(S_THREAD_LOCAL, 0, 0, ())
 { DEF = getLocalProcDefinition(DEF);
   setFramePredicate(FR, DEF);
-  setGenerationFrame(FR);
+  refreshGenerationFrame(FR);
 
   assert(DEF->codes);
   PC = DEF->codes;
@@ -3636,7 +3664,7 @@ VMI(S_WRAP, 0, 0, ())
 
   DEF = DEF->impl.wrapped.predicate;
   setFramePredicate(FR, DEF);
-  setGenerationFrame(FR);
+  refreshGenerationFrame(FR);
 
   PC = codes;
   NEXT_INSTRUCTION;
@@ -3690,12 +3718,29 @@ setStartOfVMI().
 VMI(S_CALLWRAPPER, 0, 3, (CA1_CLAUSEREF,CA1_DATA,CA1_DATA))
 { ClauseRef cref = code2ptr(ClauseRef, *PC);
 
+  if ( unlikely(ison(FR, FR_SNAPSHOT)) && ison(DEF, P_DYNAMIC) )
+    VMH_GOTO(snapshot_wrapper_error);	/* a goal of db_snapshot_call/2 */
+
   PC += 3;
   ARGP = argFrameP(FR, 0);
   FR->predicate = DEF = cref->value.clause->predicate;
   TRUST_CLAUSE(cref);
 }
 END_VMI
+
+/* The frame of a goal of db_snapshot_call/2 that reaches the supervisor
+ * of a wrapper.  Only these frames are flagged FR_SNAPSHOT and run a
+ * dynamic predicate.  See snapshotWrapperError().
+ */
+
+VMH(snapshot_wrapper_error, 0, (), ())
+{ lTop = (LocalFrame)argFrameP(FR, DEF->functor->arity);
+  SAVE_REGISTERS(QID);
+  snapshotWrapperError(FR);
+  LOAD_REGISTERS(QID);
+  THROW_EXCEPTION;
+}
+END_VMH
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 S_TABLED: Supervisor for the `table` wrapper of a variant tabled
@@ -3712,6 +3757,8 @@ When debugging we always use the wrapper, so ports are as before.
 VMI(S_TABLED, 0, 3, (CA1_CLAUSEREF,CA1_DATA,CA1_DATA))
 { atom_t clref;
 
+  if ( unlikely(ison(FR, FR_SNAPSHOT)) && ison(DEF, P_DYNAMIC) )
+    VMH_GOTO(snapshot_wrapper_error);	/* a goal of db_snapshot_call/2 */
   if ( unlikely(debugstatus.debugging) )
     VMI_GOTO(S_CALLWRAPPER);
 
@@ -5393,7 +5440,7 @@ VMH(b_throw_unwind_debug, 4, (term_t, Stack, bool, int), (catchfr_ref, outofstac
 	  LOAD_REGISTERS(QID);
 	  DEF = FR->predicate;
 	  FR->clause = NULL;
-	  VMH_GOTO(depart_or_retry_continue);
+	  VMH_GOTO(retry_continue);
 	case PL_TRACE_ACTION_ABORT:
 	  THROW_EXCEPTION;
 	case PL_TRACE_ACTION_YIELD:
@@ -7044,7 +7091,7 @@ next_choice:
 	    environment_frame = FR;
 	    DEF = FR->predicate;
 	    clearLocal(FR, FR_CAUGHT|FR_SKIPPED);
-	    VMH_GOTO(depart_or_retry_continue);
+	    VMH_GOTO(retry_continue);
 	  case PL_TRACE_ACTION_ABORT:
 	    THROW_EXCEPTION;
 	  case PL_TRACE_ACTION_YIELD:
@@ -7361,7 +7408,7 @@ VMH(debug_redo_continue, 1, (int), (action))
       if ( LD->trace.yield.redo.is_jump )
 	TRACE_RETRY;
       else
-	VMH_GOTO(depart_or_retry_continue);
+	VMH_GOTO(retry_continue);
     case PL_TRACE_ACTION_ABORT:
       THROW_EXCEPTION;
     case PL_TRACE_ACTION_YIELD:

@@ -3924,8 +3924,8 @@ localClauseGC(DECL_LD)
 
   if ( ddis->size > 0 )
   { LD->clauses.local.active = true;
-    markLocalPredicateAccess(ddis);
-    markDBSnapshots(ddis);
+    markDBSnapshots(ddis);		/* before the frames, see */
+    markLocalPredicateAccess(ddis);	/* markPredicatesInEnvironments() */
 
     FOR_TABLE(ddis, n, v)
     { Definition def = key2ptr(n);
@@ -4270,12 +4270,12 @@ pl_garbage_collect_clauses(void)
     }
 
     initBuffer(&tr_starts);
-    markPredicatesInEnvironments(LD, (Buffer)&tr_starts);
+    markDBSnapshots(GD->procedures.dirty); /* before the frames, see */
+    markPredicatesInEnvironments(LD, (Buffer)&tr_starts); /* there */
 #ifdef O_ENGINES
     forThreadLocalDataUnsuspended(markPredicatesInEnvironments,
 				  (Buffer)&tr_starts);
 #endif
-    markDBSnapshots(GD->procedures.dirty);
 
     DEBUG(MSG_CGC, Sdprintf("(marking done)\n"));
 

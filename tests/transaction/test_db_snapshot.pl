@@ -1,7 +1,7 @@
 /*  Part of SWI-Prolog
 
-    Tests for db_snapshot/1, db_snapshot_scope/2, db_snapshot_clause/3 and
-    db_snapshot_close/1.
+    Tests for db_snapshot/1, db_snapshot_scope/2, db_snapshot_call/2,
+    db_snapshot_clause/3 and db_snapshot_close/1.
 */
 
 :- module(test_db_snapshot,
@@ -10,9 +10,11 @@
 :- use_module(library(plunit)).
 :- use_module(library(aggregate)).
 :- use_module(library(lists)).
+:- use_module(library(prolog_wrap)).
 
 test_db_snapshot :-
-    run_tests([ db_snapshot
+    run_tests([ db_snapshot,
+                db_snapshot_call
               ]).
 
 :- begin_tests(db_snapshot).
@@ -599,3 +601,396 @@ test(clause_undefined, [fail]) :-
     db_snapshot_clause(S, no_such_predicate_for_db_snapshot(_), _).
 
 :- end_tests(db_snapshot).
+
+:- begin_tests(db_snapshot_call).
+
+:- dynamic p/2, r/1, rec/2, nest/2, lc/1, tr/1, p8/8, rs/1.
+:- table td/1.
+:- dynamic td/1.
+:- module_transparent tr/1.
+:- thread_local tl/1.
+
+fill(N) :-
+    retractall(p(_,_)),
+    forall(between(1, N, I),
+           ( atom_concat(k, I, K),
+             assertz(p(I, K))
+           )).
+
+count(S, Goal, Count) :-
+    aggregate_all(count, db_snapshot_call(S, Goal), Count).
+
+cleanup :-
+    retractall(p(_,_)),
+    retractall(r(_)),
+    retractall(nest(_,_)),
+    retractall(lc(_)),
+    retractall(tr(_)),
+    retractall(tl(_)).
+
+gc_then_call(Me, S, Goal) :-
+    (   undo(thread_signal(Me, garbage_collect)),
+        fail
+    ;   db_snapshot_call(S, Goal)
+    ).
+
+retry_once(exit, Frame, retry) :-
+    nb_getval(test_db_snapshot_retry, true),
+    prolog_frame_attribute(Frame, goal, Goal),
+    strip_module(Goal, _, r(_)),
+    !,
+    nb_setval(test_db_snapshot_retry, false).
+retry_once(_, _, continue).
+
+%   reentered(+Action, +Template, :Goal, -Xs)
+%
+%   Find the answers of Goal while a debugger hook runs Action at the
+%   exit of '$db_snapshot_goal'/2, between this helper and the call of
+%   the goal of db_snapshot_call/2.
+
+reentered(Action, Template, Goal, Xs) :-
+    Helper = system:'$db_snapshot_goal'(_,_),
+    nb_setval(test_db_snapshot_reenter, Action),
+    '$get_predicate_attribute'(Helper, trace, Trace),
+    current_prolog_flag(access_level, Access),
+    assert((user:prolog_trace_interception(Port, Frame, _, Act) :-
+                reenter(Port, Frame, Act)), Hook),
+    setup_call_cleanup(
+        ( set_prolog_flag(access_level, system),
+          '$set_predicate_attribute'(Helper, trace, true),
+          trace
+        ),
+        findall(Template, Goal, Xs),
+        ( notrace, nodebug,
+          '$set_predicate_attribute'(Helper, trace, Trace),
+          set_prolog_flag(access_level, Access),
+          erase(Hook)
+        )).
+
+reenter(exit, Frame, Act) :-
+    nb_getval(test_db_snapshot_reenter, Action),
+    Action \== done,
+    prolog_frame_attribute(Frame, goal, Goal),
+    strip_module(Goal, _, '$db_snapshot_goal'(_,_)),
+    !,
+    nb_setval(test_db_snapshot_reenter, done),
+    reenter_action(Action, Act).
+reenter(_, _, continue).
+
+reenter_action(call(S), continue) :-
+    garbage_collect,
+    findall(X, db_snapshot_call(S, lc(X)), Xs),
+    nb_setval(test_db_snapshot_hook, Xs).
+reenter_action(plain, continue) :-
+    garbage_collect,
+    findall(X, lc(X), Xs),
+    nb_setval(test_db_snapshot_hook, Xs).
+reenter_action(close(S), continue) :-
+    db_snapshot_close(S).
+reenter_action(fail, fail).
+reenter_action(wrap, continue) :-
+    wrap_predicate(r(_), test_db_snapshot, Wrapped, Wrapped).
+reenter_action(static, continue) :-
+    compile_predicates([rs/1]).
+
+test(assert, [Old-New == 3-4, cleanup(cleanup)]) :-
+    fill(3),
+    db_snapshot(S),
+    assertz(p(4, k4)),
+    count(S, p(_,_), Old),
+    aggregate_all(count, p(_,_), New).
+test(retract, [Old-New == 3-0, cleanup(cleanup)]) :-
+    fill(3),
+    db_snapshot(S),
+    retractall(p(_,_)),
+    count(S, p(_,_), Old),
+    aggregate_all(count, p(_,_), New).
+test(keyed, [Counts == [1,1,1,0], cleanup(cleanup)]) :-
+    fill(200),
+    db_snapshot(S),
+    forall(( between(1, 200, I), I mod 2 =:= 0 ), retract(p(I, _))),
+    assertz(p(201, k201)),
+    count(S, p(100,_), C1),
+    count(S, p(_,k100), C2),
+    count(S, p(100,k100), C3),
+    count(S, p(_,k201), C4),
+    Counts = [C1,C2,C3,C4].
+test(order, [Is == [1,2,3,4,5], cleanup(cleanup)]) :-
+    fill(5),
+    db_snapshot(S),
+    retract(p(3, _)),
+    asserta(p(0, k0)),
+    findall(I, db_snapshot_call(S, p(I,_)), Is).
+test(lazy_consume, [Seen == 100, cleanup(cleanup)]) :-
+    fill(100),
+    db_snapshot(S),
+    aggregate_all(count,
+                  ( db_snapshot_call(S, p(I,K)),
+                    retract(p(I,K)),
+                    assertz(p(I,new))
+                  ),
+                  Seen).
+test(join, [Pairs == [1-1,1-2,2-1,2-2], cleanup(cleanup)]) :-
+    retractall(p(_,_)),
+    assertz(p(a, 1)), assertz(p(a, 2)),
+    db_snapshot(S),
+    findall(X-Y,
+            ( db_snapshot_call(S, p(a,X)),
+              retract(p(a,X)),
+              db_snapshot_call(S, p(a,Y))
+            ),
+            Pairs).
+test(not_sticky, [Now == [1,2,3,4], cleanup(cleanup)]) :-
+    % Only the goal itself reads the snapshot.
+    fill(3),
+    db_snapshot(S),
+    assertz(p(4, k4)),
+    once(db_snapshot_call(S, p(1,_))),
+    findall(I, p(I,_), Now).
+test(rule_body, [Xs == [1,2,3,4], cleanup(cleanup)]) :-
+    % The clause of r/1 is selected in the snapshot; its body runs now.
+    fill(3),
+    assertz((r(X) :- p(X,_))),
+    db_snapshot(S),
+    retractall(r(_)),
+    assertz(p(4, k4)),
+    findall(X, db_snapshot_call(S, r(X)), Xs).
+test(clause_gc, [Count == 200, cleanup(cleanup)]) :-
+    fill(200),
+    db_snapshot(S),
+    retractall(p(_,_)),
+    garbage_collect_clauses,
+    count(S, p(_,_), Count).
+test(thread_local, [Xs == [1], cleanup(cleanup)]) :-
+    assertz(tl(1)),
+    db_snapshot(S),
+    retractall(tl(_)),
+    forall(between(2, 3000, I), ( assertz(tl(I)), retract(tl(I)) )),
+    findall(X, db_snapshot_call(S, tl(X)), Xs).
+test(signal_undo, [ condition(current_prolog_flag(threads, true)),
+                    N == 0,
+                    cleanup(cleanup)
+                  ]) :-
+    % Signals and undo goals that run at the call port of the goal do
+    % not change the generation of its frame.
+    assertz(p(1, k1)), assertz(p(2, k2)),
+    db_snapshot(S),
+    assertz(p(99, k99)),
+    thread_self(Me),
+    forall(between(1, 2000, _),
+           ( thread_signal(Me, (undo(true), fail ; true)),
+             forall(db_snapshot_call(S, p(X, _)), X \== 99)
+           )),
+    aggregate_all(count, ( db_snapshot_call(S, p(X, _)), X == 99 ), N).
+test(gc_before_goal, [ condition(current_prolog_flag(threads, true)),
+                       Xs == [1],
+                       cleanup(cleanup)
+                     ]) :-
+    % A garbage collection before the goal is called keeps Snapshot.
+    % The undo goal runs at the call port of db_snapshot_call/2; the
+    % signal it raises is handled at the next one, of the helper.
+    assertz(r(1)),
+    db_snapshot(S),
+    retractall(r(_)), assertz(r(2)),
+    thread_self(Me),
+    findall(X, gc_then_call(Me, S, r(X)), Xs).
+test(tail_call,[Xs == [from_undo], cleanup(retractall(rec(_,_)))]) :-
+    % The last call of a clause may reuse the frame of the goal.  It
+    % reads the current database, here after running the undo goal.
+    assertz((rec(1, X) :-
+                 ( undo(assertz(rec(0, from_undo))), fail ; true ),
+                 rec(0, X))),
+    db_snapshot(S),
+    findall(X, db_snapshot_call(S, rec(1, X)), Xs).
+test(last_call, [Xs == [from_undo], cleanup(cleanup)]) :-
+    % As tail_call, calling another predicate that is transparent.
+    assertz((lc(X) :-
+                 ( undo(assertz(tr(from_undo))), fail ; true ),
+                 tr(X))),
+    db_snapshot(S),
+    findall(X, db_snapshot_call(S, lc(X)), Xs).
+test(transaction, [Xs-Ys == [1,2]-[1,2], cleanup(cleanup)]) :-
+    % A snapshot that is created in a transaction is the database as
+    % this transaction sees it.
+    assertz(r(1)),
+    transaction(( assertz(r(2)),
+                  db_snapshot(S),
+                  retract(r(1)),
+                  assertz(r(3)),
+                  findall(X, db_snapshot_call(S, r(X)), Xs),
+                  findall(X, db_snapshot_clause(S, r(X), true), Ys)
+                )).
+test(helper, [error(permission_error(call, db_snapshot_call, _))]) :-
+    % Only db_snapshot_call/2 prepares a goal
+    db_snapshot(S),
+    '$db_snapshot_goal'(S, r(_)).
+test(nested, [Xs == [old(1),old(2),new(3)], cleanup(cleanup)]) :-
+    assertz(r(1)), assertz(r(2)),
+    db_snapshot(S1),
+    retractall(r(_)), assertz(r(3)),
+    assertz((nest(S, X) :-
+                 (   db_snapshot_call(S, r(Y)), X = old(Y)
+                 ;   r(Y), X = new(Y)
+                 ))),
+    db_snapshot(S2),
+    findall(X, db_snapshot_call(S2, nest(S1, X)), Xs).
+test(retry, [Xs == [1,2], cleanup(cleanup)]) :-
+    % The debugger retries the goal in the same snapshot.
+    assertz(r(1)), assertz(r(2)),
+    db_snapshot(S),
+    retractall(r(_)), assertz(r(3)),
+    nb_setval(test_db_snapshot_retry, true),
+    assert((user:prolog_trace_interception(Port, Frame, _, Action) :-
+                retry_once(Port, Frame, Action)), Hook),
+    call_cleanup(
+        setup_call_cleanup(
+            trace,
+            findall(X, db_snapshot_call(S, r(X)), Xs),
+            ( notrace, nodebug )),
+        erase(Hook)).
+test(reenter, [Xs-Hook == [1]-[a], cleanup(cleanup)]) :-
+    % A debugger hook calls db_snapshot_call/2 before the goal of an
+    % outer one is called
+    assertz(r(1)), assertz(lc(a)),
+    db_snapshot(S), db_snapshot(S2),
+    retractall(r(_)), assertz(r(2)), retractall(lc(_)),
+    reentered(call(S2), X, db_snapshot_call(S, r(X)), Xs),
+    nb_getval(test_db_snapshot_hook, Hook).
+test(reenter_plain, [Xs-Hook == [1]-[], cleanup(cleanup)]) :-
+    assertz(r(1)), assertz(lc(a)),
+    db_snapshot(S),
+    retractall(r(_)), assertz(r(2)), retractall(lc(_)),
+    reentered(plain, X, db_snapshot_call(S, r(X)), Xs),
+    nb_getval(test_db_snapshot_hook, Hook).
+test(reenter_close, [ error(existence_error(db_snapshot, _)),
+                      cleanup(cleanup)
+                    ]) :-
+    % The hook closes the snapshot before the goal is called
+    assertz(r(1)),
+    db_snapshot(S),
+    reentered(close(S), X, db_snapshot_call(S, r(X)), _).
+test(reenter_fail, [Xs == [2], cleanup(cleanup)]) :-
+    % The request of a db_snapshot_call/2 that the debugger made fail
+    % does not reach the next goal
+    assertz(r(1)),
+    db_snapshot(S),
+    retractall(r(_)), assertz(r(2)),
+    reentered(fail, X, ( db_snapshot_call(S, r(X)) ; r(X) ), Xs).
+test(wrapped, [ error(permission_error(access, wrapped_procedure, _)),
+                cleanup(( unwrap_predicate(r(_), test_db_snapshot),
+                          cleanup
+                        ))
+              ]) :-
+    assertz(r(1)),
+    wrap_predicate(r(_), test_db_snapshot, Wrapped, Wrapped),
+    db_snapshot(S),
+    db_snapshot_call(S, r(_)).
+test(wrapped_late, [ error(permission_error(access, wrapped_procedure, _)),
+                     cleanup(( unwrap_predicate(r(_), test_db_snapshot),
+                               cleanup
+                             ))
+                   ]) :-
+    % A wrapper that is added after the helper checked the goal
+    assertz(r(old)),
+    db_snapshot(S),
+    retractall(r(_)), assertz(r(new)),
+    reentered(wrap, X, db_snapshot_call(S, r(X)), _).
+test(scope_wrapped_late,
+     [ error(permission_error(access, wrapped_procedure, _)),
+       cleanup(( unwrap_predicate(r(_), test_db_snapshot),
+                 cleanup
+               ))
+     ]) :-
+    assertz(r(old)),
+    db_snapshot_scope(S,
+                      ( retractall(r(_)), assertz(r(new)),
+                        reentered(wrap, X, db_snapshot_call(S, r(X)), _)
+                      )).
+test(tabled, [error(permission_error(access, wrapped_procedure, _))]) :-
+    db_snapshot(S),
+    db_snapshot_call(S, td(_)).
+test(static_late, [ error(permission_error(access, private_procedure, _)),
+                    cleanup(( abolish(rs/1), dynamic(rs/1) ))
+                  ]) :-
+    % The predicate is made static after the helper checked the goal
+    assertz(rs(1)),
+    db_snapshot(S),
+    reentered(static, X, db_snapshot_call(S, rs(X)), _).
+test(control, [error(permission_error(access, private_procedure, _))]) :-
+    db_snapshot(S),
+    db_snapshot_call(S, ( r(_), true )).
+test(call_n, [ error(permission_error(access, private_procedure, _)),
+               cleanup(retractall(p8(_,_,_,_,_,_,_,_)))
+             ]) :-
+    % The meta-call compiles call/N with N > 8 into a clause of its own,
+    % also if the module defines a dynamic call/9
+    context_module(M),
+    dynamic(db_snapshot_call_n:call/9),
+    assertz(p8(a,b,c,d,e,f,g,old)),
+    db_snapshot(S),
+    retractall(p8(_,_,_,_,_,_,_,_)), assertz(p8(a,b,c,d,e,f,g,new)),
+    db_snapshot_call(S, db_snapshot_call_n:call(M:p8, a,b,c,d,e,f,g,_)).
+test(call_n_undeclared,
+     [ error(permission_error(access, private_procedure, call/9)),
+       cleanup(retractall(p8(_,_,_,_,_,_,_,_)))
+     ]) :-
+    % As call/2 ... call/8, rather than failing as an undefined predicate
+    assertz(p8(a,b,c,d,e,f,g,old)),
+    db_snapshot(S),
+    db_snapshot_call(S, call(p8, a,b,c,d,e,f,g,_)).
+test(engine, [ condition(current_prolog_flag(engines, true)),
+               AB == [1,2],
+               cleanup(cleanup)
+             ]) :-
+    % An engine that creates its own snapshot is a stable cursor.
+    assertz(p(1, k1)), assertz(p(2, k2)),
+    setup_call_cleanup(
+        engine_create(X, ( db_snapshot(S), db_snapshot_call(S, p(X, _)) ), E),
+        ( engine_next(E, A),
+          retractall(p(_,_)), assertz(p(99, k99)),
+          engine_next(E, B)
+        ),
+        engine_destroy(E)),
+    AB = [A,B].
+test(undefined, [fail]) :-
+    db_snapshot(S),
+    db_snapshot_call(S, no_such_predicate_for_db_snapshot(_)).
+test(static, [error(permission_error(access, private_procedure, _))]) :-
+    db_snapshot(S),
+    db_snapshot_call(S, lists:append(_,_,_)).
+test(closed, [error(existence_error(db_snapshot, _)), cleanup(cleanup)]) :-
+    fill(3),
+    db_snapshot(S),
+    db_snapshot_close(S),
+    db_snapshot_call(S, p(_,_)).
+test(scope_blob_frame, [ error(existence_error(db_snapshot, _)),
+                          cleanup(cleanup)
+                        ]) :-
+    % The frame of a goal of db_snapshot_call/2 holds no scope
+    assertz(r(1)),
+    db_snapshot(B),
+    db_snapshot_scope(S, true),
+    db_snapshot_call(B, scope_user(S, _)).
+test(other_thread, [ condition(current_prolog_flag(threads, true)),
+                     error(permission_error(access, db_snapshot, _)),
+                     cleanup(cleanup)
+                   ]) :-
+    fill(3),
+    thread_self(Me),
+    thread_create(( db_snapshot(S0),
+                    thread_send_message(Me, snapshot(S0)),
+                    thread_get_message(done)
+                  ), Id),
+    thread_get_message(snapshot(S)),
+    call_cleanup(db_snapshot_call(S, p(_,_)),
+                 ( thread_send_message(Id, done),
+                   thread_join(Id, _)
+                 )).
+
+:- dynamic scope_user/2.
+
+scope_user(S, Xs) :-
+    findall(X, db_snapshot_call(S, r(X)), Xs),
+    true.
+
+:- end_tests(db_snapshot_call).

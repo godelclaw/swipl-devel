@@ -407,6 +407,8 @@ struct PL_global_data
     Procedure	dtranslated_source2;	/* system:$translated_source/2 */
     Procedure	findall_loop4;		/* $bags:findall_loop/4 */
     Procedure	db_snapshot_scope2;	/* $syspreds:db_snapshot_scope/2 */
+    Procedure	db_snapshot_call2;	/* $syspreds:db_snapshot_call/2 */
+    Procedure	db_snapshot_goal2;	/* system:$db_snapshot_goal/2 */
     Procedure	heartbeat0;		/* prolog:heartbeat/0 */
 
     int		static_dirty;		/* #static dirty procedures */
