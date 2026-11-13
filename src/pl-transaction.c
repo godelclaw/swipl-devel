@@ -44,6 +44,9 @@
 #include "pl-util.h"
 #include "pl-pro.h"
 #include "pl-wam.h"
+#include "pl-fli.h"
+#include "pl-gc.h"
+#include "pl-attvar.h"
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 This module implements _transactions_, notably _isolating_ transactions.
@@ -101,6 +104,7 @@ typedef struct tr_stack
   struct tbl_trail *table_trail;	/* Parent changes to tables */
   term_t	    id;			/* Parent goal */
   unsigned int	    flags;		/* TR_* flags */
+  uint64_t	    snapshots;		/* Snapshots made before the start */
 } tr_stack;
 
 static void
@@ -525,6 +529,11 @@ announce_updates(DECL_LD Buffer updates)
 		 *	PROLOG CONNECTION	*
 		 *******************************/
 
+#define closeTransactionSnapshots(n) LDFUNC(closeTransactionSnapshots, n)
+#define LDFUNC_DECLARATIONS
+static void closeTransactionSnapshots(uint64_t n);
+#undef LDFUNC_DECLARATIONS
+
 /* The start generation of a transaction pins the global view of its
  * goal: clause GC marks it for every dirty predicate (see
  * markPredicatesInEnvironments()).  A clause GC that read the global
@@ -562,7 +571,8 @@ transaction(DECL_LD term_t goal, term_t constraint, term_t lock, int flags)
 			.table_trail = LD->transaction.table_trail,
 			.parent      = LD->transaction.stack,
 			.id          = LD->transaction.id,
-			.flags       = LD->transaction.flags
+			.flags       = LD->transaction.flags,
+			.snapshots   = LD->transaction.snapshots
 		      };
 
     LD->transaction.clauses     = NULL;
@@ -612,6 +622,7 @@ transaction(DECL_LD term_t goal, term_t constraint, term_t lock, int flags)
       rc = transaction_discard() && rc;
       rc = transaction_rollback_tables() && rc;
       LD->transaction.generation = parent.generation;
+      closeTransactionSnapshots(parent.snapshots);
     }
     LD->transaction.gen_nest    = parent.gen_nest;
     LD->transaction.clauses     = parent.clauses;
@@ -646,6 +657,7 @@ transaction(DECL_LD term_t goal, term_t constraint, term_t lock, int flags)
       if ( constraint )
       { if ( (rc=TR_LOCK()) )
 	{ locked = true;
+	  closeTransactionSnapshots(0); /* their view moves with gen_start */
 	  setTransactionStart();
 	  rc = callProlog(NULL, constraint, PL_Q_PASS_EXCEPTION, NULL);
 	}
@@ -669,6 +681,7 @@ transaction(DECL_LD term_t goal, term_t constraint, term_t lock, int flags)
       rc = transaction_discard() && rc;
       rc = transaction_rollback_tables() && rc;
     }
+    closeTransactionSnapshots(0);
     LD->transaction.id         = 0;
     LD->transaction.generation = 0;
     LD->transaction.gen_max    = 0;
@@ -858,7 +871,458 @@ PRED_IMPL("pred_generations", 1, pred_generations, PL_FA_TRANSPARENT)
 #define META PL_FA_TRANSPARENT
 #define NDET PL_FA_NONDETERMINISTIC
 
+		 /*******************************
+		 *	 DATABASE SNAPSHOTS	*
+		 *******************************/
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+A database snapshot is a handle to the generation of the database at the
+time db_snapshot/1 was called.  db_snapshot_clause/3 enumerates the
+clauses of a predicate that are visible in this generation, also if they
+are erased later.  This is the same information snapshot/1 uses, but the
+handle can be kept while the calling goal continues and modifies the
+database.
+
+Clause GC keeps the clauses that are visible to an open snapshot.  The
+generation is read and the snapshot is added to the list while holding
+the lock that markDBSnapshots() holds, so a clause GC either sees the
+snapshot or the snapshot is not older than the start of this clause GC.
+
+A snapshot is closed by db_snapshot_close/1 or when its handle is
+reclaimed by atom GC.  As an open snapshot keeps all clauses that are
+erased after it was created, goals that create many snapshots should
+close them.  A snapshot can only be used and closed by the engine that
+created it.  This engine cannot close the snapshot while it is starting
+a goal in it, so no clause GC can run between reading the generation of
+an open snapshot and the frame that uses it.
+
+db_snapshot_scope(-Snapshot, :Goal) creates a snapshot that lives as
+long as its own frame, i.e., while Goal runs, and costs no allocation:
+
+    db_snapshot_scope(Snapshot, Goal) :-
+	'$db_snapshot_scope'(Snapshot),
+	call(Goal),
+	integer(Snapshot).
+
+'$db_snapshot_scope'/1 gives the frame of db_snapshot_scope/2 the
+current generation and flags it FR_SNAPSHOT.  Snapshot is a number that
+no other scope in the process gets; it stays in the first argument of
+the frame, which the final integer/1 keeps alive.  Snapshot is valid while
+the frame of db_snapshot_scope/2 with this number is an ancestor of the
+frame that uses it, see scope_generation().  Clause GC keeps, for all
+predicates, the clauses visible in the generation of every frame flagged
+FR_SNAPSHOT.  The generation is read and the frame is flagged while
+holding the scan lock of the thread, which clause GC holds while it
+scans the frames of a thread, so a clause GC either sees the flag or the
+generation is not older than the start of this clause GC.
+
+A snapshot that is created inside a transaction is the database as this
+transaction sees it at that time.  It also holds the generation of the
+transaction, which is used for the predicates that take part in
+transactions.  As for any goal in a transaction, the other predicates
+are read in their current state.  Clause GC keeps the clauses that are
+visible in either generation.  The generation of the transaction has no
+meaning after the changes it refers to are committed or discarded, so
+the snapshot is closed if the transaction ends and if a nested
+transaction it was created in is discarded.  The generation cannot tell
+the latter: before its first change a nested transaction has the
+generation of its parent.  The engine therefore numbers the snapshots
+it makes in transactions, and a nested transaction that is discarded
+closes those with a higher number than at its start.  transaction/3
+also closes these snapshots before it calls its constraint, as it then
+moves the start of the transaction to the current generation.  See
+closeTransactionSnapshots().  A snapshot of db_snapshot_scope/2 is gone
+before that: its frame ends with the goal of the transaction.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+typedef struct db_snapshot
+{ gen_t		      generation;	/* 0: closed */
+  gen_t		      tr_generation;	/* generation in my transaction or 0 */
+  uint64_t	      tr_number;	/* number in my engine's transactions */
+  uint64_t	      owner;		/* engine that created me */
+  struct db_snapshot *next;
+  struct db_snapshot *prev;
+} db_snapshot;
+
+static db_snapshot *db_snapshots = NULL;	/* open snapshots */
+static int64_t db_snapshot_scopes = 0;		/* last db_snapshot_scope/2 */
+
+/* A snapshot belongs to the engine that created it.  We identify the
+ * engine by its sequence number, which, unlike its thread id, is not
+ * reused.
+ */
+
+#ifdef O_ENGINES
+#define SNAPSHOT_OWNER() (LD->thread.seq_id)
+#else
+#define SNAPSHOT_OWNER() ((uint64_t)0)
+#endif
+
+static void
+unlink_db_snapshot(db_snapshot *sn)	/* holding L_MISC */
+{ if ( sn->generation )
+  { if ( sn->prev )
+      sn->prev->next = sn->next;
+    else
+      db_snapshots = sn->next;
+    if ( sn->next )
+      sn->next->prev = sn->prev;
+    sn->generation = 0;
+  }
+}
+
+static void
+close_db_snapshot(db_snapshot *sn)
+{ PL_LOCK(L_MISC);
+  unlink_db_snapshot(sn);
+  PL_UNLOCK(L_MISC);
+}
+
+/* Close the snapshots this engine made in a transaction after it made
+ * `n` of them.  Called with the number at the start of a nested
+ * transaction that is discarded and with 0 if the outermost transaction
+ * ends or transaction/3 calls its constraint.
+ */
+
+static void
+closeTransactionSnapshots(DECL_LD uint64_t n)
+{ if ( db_snapshots )
+  { uint64_t owner = SNAPSHOT_OWNER();
+    db_snapshot *next;
+
+    PL_LOCK(L_MISC);
+    for(db_snapshot *sn = db_snapshots; sn; sn = next)
+    { next = sn->next;
+      if ( sn->owner == owner && sn->tr_number > n )
+	unlink_db_snapshot(sn);
+    }
+    PL_UNLOCK(L_MISC);
+  }
+}
+
+static int
+release_db_snapshot(atom_t aref)
+{ db_snapshot *sn = PL_blob_data(aref, NULL, NULL);
+
+  close_db_snapshot(sn);
+  PL_free(sn);
+
+  return true;
+}
+
+static int
+write_db_snapshot(IOSTREAM *s, atom_t aref, int flags)
+{ db_snapshot *sn = PL_blob_data(aref, NULL, NULL);
+  (void)flags;
+
+  Sfprintf(s, "<db_snapshot>(%p)", sn);
+  return true;
+}
+
+static PL_blob_t db_snapshot_blob =
+{ PL_BLOB_MAGIC,
+  PL_BLOB_UNIQUE|PL_BLOB_NOCOPY,
+  "db_snapshot",
+  release_db_snapshot,
+  NULL,
+  write_db_snapshot
+};
+
+static bool
+get_db_snapshot(term_t t, db_snapshot **snp)
+{ void *data;
+  PL_blob_t *type;
+
+  if ( PL_get_blob(t, &data, NULL, &type) && type == &db_snapshot_blob )
+  { *snp = data;
+    return true;
+  }
+
+  return PL_type_error("db_snapshot", t);
+}
+
+/* A snapshot of db_snapshot_scope/2 is the number of its scope, unique
+ * in the process, so a number passed to another engine or thread cannot
+ * match a scope there.  It is valid while an ancestor of the frame that
+ * uses it is the frame of db_snapshot_scope/2 whose first argument is
+ * this number.  This frame is flagged FR_SNAPSHOT, so clause GC keeps the
+ * clauses visible in its generation.  Made in a transaction, this is a
+ * generation of the transaction.  As for any frame, it is only used for
+ * the predicates that take part in transactions.
+ */
+
+#define scope_generation(id, def, gen) \
+	LDFUNC(scope_generation, id, def, gen)
+
+static bool
+scope_generation(DECL_LD word id, Definition def, gen_t *gen)
+{ for(LocalFrame fr = environment_frame; fr; fr = parentFrame(fr))
+  { if ( isSnapshotScopeFrame(fr) )
+    { Word p = argFrameP(fr, 0);
+
+      deRef(p);
+      if ( *p == id )			/* both tagged integers */
+      { gen_t g = generationFrame(fr);
+
+	if ( g >= GEN_TRANSACTION_BASE && !(def && ison(def, P_TRANSACT)) )
+	  g = GEN_INVALID;		/* see snapshot_generation() */
+	*gen = g;
+	return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/* Get the generation of the open snapshot `w`, a dereferenced cell, for
+ * the clauses of `def`.  False, without an exception, if `w` is not a
+ * snapshot this engine can use.  GEN_INVALID if the snapshot was made in
+ * a transaction and `def` does not take part in transactions: the goal
+ * then sees the current database, as any goal in the transaction, and
+ * keeps the generation it got at its call port.  A fresh generation
+ * stored without the loop of setGenerationFrame() could be missed by
+ * clause GC.
+ */
+
+#define snapshot_generation(w, def, gen) \
+	LDFUNC(snapshot_generation, w, def, gen)
+
+static bool
+snapshot_generation(DECL_LD word w, Definition def, gen_t *gen)
+{ if ( isTaggedInt(w) )
+    return scope_generation(w, def, gen);
+  if ( isAtom(w) )
+  { Atom a = atomValue(w);
+    db_snapshot *sn = (db_snapshot *)a->name;
+
+    if ( a->type == &db_snapshot_blob &&
+	 sn->owner == SNAPSHOT_OWNER() && sn->generation )
+    { if ( !sn->tr_generation )
+	*gen = sn->generation;
+      else if ( def && ison(def, P_TRANSACT) )
+	*gen = sn->tr_generation;
+      else
+	*gen = GEN_INVALID;		/* as for any goal in a transaction */
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/* Raise the error for `t` if snapshot_generation() is false for it */
+
+static bool
+db_snapshot_error(term_t t)
+{ GET_LD
+  atom_t type = PL_new_atom("db_snapshot");
+  Word p = valTermRef(t);
+  Atom a = NULL;
+  bool rc;
+
+  deRef(p);
+  if ( isAtom(*p) && (a=atomValue(*p))->type != &db_snapshot_blob )
+    a = NULL;
+  if ( a && ((db_snapshot *)a->name)->owner != SNAPSHOT_OWNER() )
+    rc = PL_error(NULL, 0, NULL, ERR_PERMISSION, ATOM_access, type, t);
+  else if ( a || isInteger(*p) )	/* closed or no such scope */
+    rc = PL_error(NULL, 0, NULL, ERR_EXISTENCE, type, t);
+  else
+    rc = PL_error(NULL, 0, NULL, ERR_TYPE, type, t);
+  PL_unregister_atom(type);
+
+  return rc;
+}
+
+/* Get the generation of an open snapshot for the clauses of `def`.  If
+ * `def` is NULL, we only verify that we can use the snapshot.
+ */
+
+bool
+get_db_snapshot_generation(term_t t, Definition def, gen_t *gen)
+{ GET_LD
+  Word p = valTermRef(t);
+
+  deRef(p);
+  return snapshot_generation(*p, def, gen) || db_snapshot_error(t);
+}
+
+/* Called by clause GC after it reset the predicates in `ddis`: all
+ * open snapshots access all these predicates.  `ddis` is the table of
+ * dirty predicates or the thread-local predicates of localClauseGC().
+ */
+
+void
+markDBSnapshots(TablePP ddis)
+{ PL_LOCK(L_MISC);
+  if ( db_snapshots )
+  { FOR_TABLE(ddis, n, v)
+    { DirtyDefInfo ddi = val2ptr(v);
+
+      for(db_snapshot *sn = db_snapshots; sn; sn = sn->next)
+      { ddi_add_access_gen(ddi, sn->generation);
+	if ( sn->tr_generation )
+	  ddi_add_access_gen(ddi, sn->tr_generation);
+      }
+    }
+  }
+  PL_UNLOCK(L_MISC);
+}
+
+/* Clause GC calls addSnapshotGeneration() for every frame it finds that
+ * is flagged FR_SNAPSHOT and then markSnapshotGenerations() for the
+ * predicates in `ddis`, which keep the clauses visible in each of these
+ * generations.  Frames of a goal of db_snapshot_call/2 mostly follow the
+ * frame of their snapshot, so we only skip a repeat of the last
+ * generation here and sort out the others before marking.
+ */
+
+void
+addSnapshotGeneration(Buffer gens, gen_t gen)
+{ if ( isEmptyBuffer(gens) || topBuffer(gens, gen_t)[-1] != gen )
+    addBuffer(gens, gen, gen_t);
+}
+
+static int
+compare_generations(const void *p1, const void *p2)
+{ gen_t g1 = *(const gen_t*)p1;
+  gen_t g2 = *(const gen_t*)p2;
+
+  return g1 < g2 ? -1 : g1 > g2 ? 1 : 0;
+}
+
+void
+markSnapshotGenerations(TablePP ddis, Buffer gens)
+{ size_t count = entriesBuffer(gens, gen_t);
+
+  if ( count > 0 )
+  { gen_t *g = baseBuffer(gens, gen_t);
+    size_t n = 1;
+
+    qsort(g, count, sizeof(gen_t), compare_generations);
+    for(size_t i=1; i<count; i++)
+    { if ( g[i] != g[n-1] )
+	g[n++] = g[i];
+    }
+
+    FOR_TABLE(ddis, k, v)
+    { DirtyDefInfo ddi = val2ptr(v);
+
+      for(size_t i=0; i<n; i++)
+	ddi_add_access_gen(ddi, g[i]);
+    }
+  }
+}
+
+#define new_db_snapshot(_) LDFUNC(new_db_snapshot, _)
+static db_snapshot *
+new_db_snapshot(DECL_LD)
+{ db_snapshot *sn = PL_malloc(sizeof(*sn));
+
+  sn->owner = SNAPSHOT_OWNER();
+  sn->tr_generation = LD->transaction.generation;
+  sn->tr_number = sn->tr_generation ? ++LD->transaction.snapshots : 0;
+  PL_LOCK(L_MISC);
+  sn->generation = global_generation();
+  sn->prev = NULL;
+  sn->next = db_snapshots;
+  if ( db_snapshots )
+    db_snapshots->prev = sn;
+  db_snapshots = sn;
+  PL_UNLOCK(L_MISC);
+
+  return sn;
+}
+
+/** db_snapshot(-Snapshot) is det.
+ *
+ *  Snapshot is a handle to the current state of the dynamic predicates.
+ */
+
+static
+PRED_IMPL("db_snapshot", 1, db_snapshot, 0)
+{ PRED_LD
+  db_snapshot *sn = new_db_snapshot();
+
+  if ( PL_unify_blob(A1, sn, sizeof(*sn), &db_snapshot_blob) )
+    return true;
+  close_db_snapshot(sn);		/* the blob is reclaimed by atom GC */
+  return false;
+}
+
+/** '$db_snapshot_scope'(-Snapshot) is det.
+ *
+ *  Make the frame of our caller, db_snapshot_scope/2, hold a snapshot
+ *  of the current state and unify Snapshot with a new number for this
+ *  scope.  See above.
+ */
+
+static
+PRED_IMPL("$db_snapshot_scope", 1, db_snapshot_scope, 0)
+{ PRED_LD
+  Procedure proc = _PL_predicate("db_snapshot_scope", 2, "$syspreds",
+				 &GD->procedures.db_snapshot_scope2);
+  LocalFrame fr;
+  Word p;
+  int64_t id;
+  gen_t gen;
+
+  if ( !hasGlobalSpace(0) &&		/* room for bindConst() below; */
+       !ensureGlobalSpace(0, ALLOW_GC) ) /* this may move the stacks */
+    return false;
+  fr = environment_frame->parent;
+  p  = valTermRef(A1);
+  if ( fr->predicate != proc->definition )
+    return PL_permission_error("call", "db_snapshot_scope", A1);
+  deRef(p);
+  if ( !canBind(*p) )			/* Snapshot will be a new number */
+    return false;
+  if ( (id=ATOMIC_INC(&db_snapshot_scopes)) > PLMAXTAGGEDINT )
+    return PL_resource_error("db_snapshot_scopes"); /* never reuse one */
+
+#ifdef O_PLMT
+  simpleMutexLock(&LD->thread.scan_lock);
+#endif
+  if ( !(gen=LD->transaction.generation) )
+    gen = global_generation();
+  setGenerationFrameVal(fr, gen);
+  set(fr, FR_SNAPSHOT);
+#ifdef O_PLMT
+  simpleMutexUnlock(&LD->thread.scan_lock);
+#endif
+
+  return bindConst(p, consInt(id));
+}
+
+/** db_snapshot_close(+Snapshot) is det.
+ *
+ *  Close Snapshot.  Clauses that are only visible to Snapshot become
+ *  subject to clause GC.  Closing a closed snapshot has no effect.  A
+ *  snapshot of db_snapshot_scope/2 ends with its goal and cannot be
+ *  closed.
+ */
+
+static
+PRED_IMPL("db_snapshot_close", 1, db_snapshot_close, 0)
+{ PRED_LD
+  db_snapshot *sn = NULL;
+
+  if ( PL_is_integer(A1) )
+    return PL_permission_error("close", "db_snapshot", A1);
+  if ( !get_db_snapshot(A1, &sn) )
+    return false;
+  if ( sn->owner != SNAPSHOT_OWNER() )
+    return PL_permission_error("close", "db_snapshot", A1);
+  close_db_snapshot(sn);
+
+  return true;
+}
+
 BeginPredDefs(transaction)
+  PRED_DEF("db_snapshot",         1, db_snapshot,         0)
+  PRED_DEF("$db_snapshot_scope",  1, db_snapshot_scope,   0)
+  PRED_DEF("db_snapshot_close",   1, db_snapshot_close,   0)
   PRED_DEF("$transaction",        2, transaction,         META)
   PRED_DEF("$transaction",        3, transaction,         META)
   PRED_DEF("$snapshot",           1, snapshot,            META)

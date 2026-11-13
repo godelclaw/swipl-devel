@@ -86,6 +86,7 @@
             transaction/2,                      % :Goal, +Options
             transaction/3,                      % :Goal, :Constraint, +Mutex
             snapshot/1,                         % :Goal
+            db_snapshot_scope/2,                % -Snapshot, :Goal
             undo/1,                             % :Goal
             set_prolog_gc_thread/1,		% +Status
 
@@ -99,6 +100,7 @@
     transaction(0),
     transaction(0,0,+),
     snapshot(0),
+    db_snapshot_scope(-, 0),
     rule(:, -),
     rule(:, -, ?),
     sig_block(:),
@@ -1689,6 +1691,19 @@ transaction(Goal, Constraint, Mutex) :-
     '$transaction'(Goal, Constraint, Mutex).
 snapshot(Goal) :-
     '$snapshot'(Goal).
+
+%!  db_snapshot_scope(-Snapshot, :Goal) is nondet.
+%
+%   Call Goal with Snapshot bound to the current state of the dynamic
+%   predicates.  This frame holds the snapshot: it exists until Goal is
+%   done, which the final integer/1 makes sure of.  It also keeps the
+%   first argument, which identifies the snapshot, alive.  See
+%   '$db_snapshot_scope'/1.
+
+db_snapshot_scope(Snapshot, Goal) :-
+    '$db_snapshot_scope'(Snapshot),
+    call(Goal),
+    integer(Snapshot).
 
 
 		 /*******************************

@@ -53,6 +53,7 @@
 #include "pl-bag.h"
 #include "pl-wam.h"
 #include "pl-write.h"
+#include "pl-transaction.h"
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 This module is based on
@@ -6546,6 +6547,7 @@ void
 markPredicatesInEnvironments(PL_local_data_t *ld, void *ctx)
 { GET_LD
   Word lbase, lend, current;
+  tmp_buffer snapshots;			/* generations of FR_SNAPSHOT frames */
 
   if ( !ld->magic )
     return;				/* thread is exiting; see */
@@ -6561,6 +6563,7 @@ markPredicatesInEnvironments(PL_local_data_t *ld, void *ctx)
     addBuffer(tr_starts, ld->transaction.generation, gen_t);
   }
 
+  initBuffer(&snapshots);
   lbase = (Word)ld->stacks.local.base;
   lend  = (Word)ld->stacks.local.top;		/* see (*) */
   if ( (Word)ld->stacks.local.max - lend > 2*ARGOFFSET/(int)sizeof(word) )
@@ -6578,8 +6581,12 @@ markPredicatesInEnvironments(PL_local_data_t *ld, void *ctx)
 
 	ddi_add_access_gen(ddi, gen);
       }
+      if ( unlikely(ison(fr, FR_SNAPSHOT)) )
+	addSnapshotGeneration((Buffer)&snapshots, generationFrame(fr));
     }
   }
+  markSnapshotGenerations(GD->procedures.dirty, (Buffer)&snapshots);
+  discardBuffer(&snapshots);
 
   ld->clauses.erased_skipped = 0;
   markAccessedPredicates(ld);

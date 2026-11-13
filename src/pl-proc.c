@@ -3860,13 +3860,20 @@ markLocalPredicateAccess(DECL_LD TablePP ddis)
 { Word lbase = (Word)LD->stacks.local.base;
   Word lend  = (Word)LD->stacks.local.top;
   definition_refs *refs = &LD->predicate_references;
+  tmp_buffer snapshots;			/* generations of FR_SNAPSHOT frames */
 
+  initBuffer(&snapshots);
   for(Word current = lbase; current < lend; current++)
   { LocalFrame fr = (LocalFrame)current;
 
     if ( isFrame(fr) )
-      local_add_access_gen(ddis, fr->predicate, generationFrame(fr));
+    { local_add_access_gen(ddis, fr->predicate, generationFrame(fr));
+      if ( unlikely(ison(fr, FR_SNAPSHOT)) )
+	addSnapshotGeneration((Buffer)&snapshots, generationFrame(fr));
+    }
   }
+  markSnapshotGenerations(ddis, (Buffer)&snapshots);
+  discardBuffer(&snapshots);
 
   for(size_t i=1; i<=refs->top; i++)
   { definition_ref *dref = &refs->blocks[MSB(i)][i];
@@ -3918,6 +3925,7 @@ localClauseGC(DECL_LD)
   if ( ddis->size > 0 )
   { LD->clauses.local.active = true;
     markLocalPredicateAccess(ddis);
+    markDBSnapshots(ddis);
 
     FOR_TABLE(ddis, n, v)
     { Definition def = key2ptr(n);
@@ -4267,6 +4275,7 @@ pl_garbage_collect_clauses(void)
     forThreadLocalDataUnsuspended(markPredicatesInEnvironments,
 				  (Buffer)&tr_starts);
 #endif
+    markDBSnapshots(GD->procedures.dirty);
 
     DEBUG(MSG_CGC, Sdprintf("(marking done)\n"));
 

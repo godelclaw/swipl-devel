@@ -406,6 +406,7 @@ struct PL_global_data
     Procedure	drun_initialization2;	/* system:$run_initialization/2 */
     Procedure	dtranslated_source2;	/* system:$translated_source/2 */
     Procedure	findall_loop4;		/* $bags:findall_loop/4 */
+    Procedure	db_snapshot_scope2;	/* $syspreds:db_snapshot_scope/2 */
     Procedure	heartbeat0;		/* prolog:heartbeat/0 */
 
     int		static_dirty;		/* #static dirty procedures */
@@ -974,6 +975,7 @@ struct PL_local_data
     term_t	      id;		/* Default the goal */
     struct tr_stack  *stack;		/* Nested transaction stack */
     unsigned int      flags;		/*  */
+    uint64_t	      snapshots;	/* # db_snapshot/1 in transactions */
   } transaction;
 
 #ifdef O_LOCALE

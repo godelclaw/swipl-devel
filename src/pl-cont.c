@@ -42,6 +42,7 @@
 #include "pl-pro.h"
 #include "pl-fli.h"
 #include "pl-modul.h"
+#include "pl-transaction.h"
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 Implementation of `delimited continuation'.  Implements
@@ -73,6 +74,7 @@ Where the compiler translates '$reset' into
 
 #define FRESET_NO_FRAME -1
 #define FRESET_FINDALL  -2
+#define FRESET_SNAPSHOT -3
 
 #define findReset(fr, ball, rframe) LDFUNC(findReset, fr, ball, rframe)
 static int /* true, FRESET_* */
@@ -88,6 +90,8 @@ findReset(DECL_LD LocalFrame fr, term_t ball, term_t *rframe)
 
     if ( fr->predicate == proc_fl->definition )
       return FRESET_FINDALL;
+    if ( isSnapshotScopeFrame(fr) )	/* its snapshot ends with the frame */
+      return FRESET_SNAPSHOT;
 
     if ( fr->predicate != reset3 && fr->predicate != reset6 )
       continue;
@@ -421,7 +425,8 @@ shift(DECL_LD term_t ball, bool for_copy)
 
   { static const char *msg[] =
     { "No matching reset/3 call",
-      "Cannot catch continuation through findall/3"
+      "Cannot catch continuation through findall/3",
+      "Cannot catch continuation through db_snapshot_scope/2"
     };
 
     return PL_error("shift", 1, msg[-1-rc],

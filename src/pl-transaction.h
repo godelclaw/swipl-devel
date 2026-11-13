@@ -58,10 +58,26 @@
 int	transaction_retract_clause(Clause clause);
 int	transaction_assert_clause(Clause clause, ClauseRef where);
 int	transaction_visible_clause(Clause cl, gen_t gen);
+bool	get_db_snapshot_generation(term_t t, Definition def, gen_t *gen);
+void	markDBSnapshots(TablePP ddis);
+void	addSnapshotGeneration(Buffer gens, gen_t gen);
+void	markSnapshotGenerations(TablePP ddis, Buffer gens);
 gen_t	transaction_last_modified_predicate(Definition def);
 void	transaction_set_last_modified(Definition def,
 				      gen_t gen, int flags);
 
 #undef LDFUNC_DECLARATIONS
+
+/* True if `fr` is the frame of db_snapshot_scope/2 that holds a snapshot.
+ * '$db_snapshot_scope'/1 resolves the procedure before it flags a frame.
+ */
+
+static inline bool
+isSnapshotScopeFrame(LocalFrame fr)
+{ Procedure proc = GD->procedures.db_snapshot_scope2;
+
+  return ( ison(fr, FR_SNAPSHOT) && proc &&
+	   fr->predicate == proc->definition );
+}
 
 #endif /*_PL_TRANSACTION_H*/

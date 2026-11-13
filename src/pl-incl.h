@@ -1233,6 +1233,7 @@ Macros for environment frames (local stack frames)
 #define FR_DET			(0x0800) /* Declared det */
 #define FR_DETGUARD		(0x1000) /* Frame is guarded for determinism */
 #define FR_DETGUARD_SET		(0x2000) /* Flag was set on this frame */
+#define FR_SNAPSHOT		(0x4000) /* generation is a db snapshot */
 #define FR_WATCHED (FR_CLEANUP|FR_NOTIFY)
 
 #define FR_MAGIC_MASK		(0xffff0000)
@@ -1313,7 +1314,7 @@ typedef uint64_t lgen_t;
 #define FR_LCO_CLEAR	(FR_SKIPPED|FR_WATCHED|FR_CAUGHT|\
 			 FR_HIDE_CHILDS|FR_CLEANUP|FR_SSU_DET)
 #define FR_CLEAR_NEXT	(FR_LCO_CLEAR|FR_DET|FR_DETGUARD)
-#define FR_CLEAR_ALWAYS (FR_CONTEXT|FR_DETGUARD_SET)
+#define FR_CLEAR_ALWAYS (FR_CONTEXT|FR_DETGUARD_SET|FR_SNAPSHOT)
 #define FR_CLEAR_FLAGS	(FR_CLEAR_NEXT|FR_CLEAR_ALWAYS)
 
 #define setNextFrameFlags(next, fr) \
@@ -1338,7 +1339,7 @@ typedef uint64_t lgen_t;
 #define tcallSetNextFrameFlags(fr) \
 	do \
 	{ (fr)->level = (fr)->level+1; \
-	  (fr)->flags = ((fr)->flags) & ~(FR_LCO_CLEAR|FR_DETGUARD_SET); \
+	  (fr)->flags = ((fr)->flags) & ~(FR_LCO_CLEAR|FR_DETGUARD_SET|FR_SNAPSHOT); \
 	} while(0)
 
 #define setFramePredicate(fr, def) \

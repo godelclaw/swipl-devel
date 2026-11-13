@@ -41,6 +41,7 @@
 #include "pl-comp.h"
 #include "pl-arith.h"
 #include "pl-dbref.h"
+#include "pl-transaction.h"
 #include "pl-event.h"
 #include "pl-inline.h"
 #include "pl-tabling.h"
@@ -8398,7 +8399,7 @@ protected_predicate(DECL_LD Definition def)
 
 static foreign_t
 clause(term_t head, term_t body, term_t ref, term_t bindings, int flags,
-       size_t PL__ac, control_t PL__ctx)
+       term_t snapshot, size_t PL__ac, control_t PL__ctx)
 { PRED_LD
   Procedure proc;
   Definition def;
@@ -8412,6 +8413,7 @@ clause(term_t head, term_t body, term_t ref, term_t bindings, int flags,
   term_t b    = PL_new_term_ref();
   fid_t fid;
   int rc = false;
+  gen_t at = 0;
 
   if ( CTX_ARITY < 3 ) ref = 0;
   if ( CTX_ARITY < 4 ) bindings = 0;
@@ -8461,7 +8463,18 @@ clause(term_t head, term_t body, term_t ref, term_t bindings, int flags,
       if ( !isDefinedProcedure(proc) && ison(def, P_AUTOLOAD) )
 	def = trapUndefined(def);
 
+      if ( snapshot && isoff(def, P_DYNAMIC) ) /* db_snapshot_clause/3 */
+      { bool defined = isDefinedProcedure(proc);
+
+	releaseProcedureRef(proc);	/* as db_snapshot_call/2 */
+	if ( defined )
+	  return PL_error("db_snapshot_clause", 3, NULL, ERR_PERMISSION_PROC,
+			  ATOM_access, ATOM_private_procedure, proc);
+	return false;
+      }
       if ( protected_predicate(def) ||
+	   ( snapshot &&
+	     !get_db_snapshot_generation(snapshot, def, &at) ) ||
 	   !(dref=pushPredicateAccessObj(def)) )
       { releaseProcedureRef(proc);
 	return false;
@@ -8469,6 +8482,8 @@ clause(term_t head, term_t body, term_t ref, term_t bindings, int flags,
       releaseProcedureRef(proc);	/* def is now accessed */
 
       chp = NULL;
+      if ( at )
+	dref->generation = at;
       setGenerationFrameVal(environment_frame, dref->generation);
       break;
     }
@@ -8571,12 +8586,24 @@ out:
 
 static
 PRED_IMPL("clause", va, clause, PL_FA_TRANSPARENT|PL_FA_NONDETERMINISTIC)
-{ return clause(A1, A2, A3, A4, IS_CLAUSE, PL__ac, PL__ctx);
+{ return clause(A1, A2, A3, A4, IS_CLAUSE, 0, PL__ac, PL__ctx);
+}
+
+/** db_snapshot_clause(+Snapshot, :Head, ?Body) is nondet.
+ *
+ *  As clause/2, for the clauses that were visible when Snapshot was
+ *  created.  The generation is kept in the frame, as for clause/2.
+ */
+
+static
+PRED_IMPL("db_snapshot_clause", 3, db_snapshot_clause,
+	  PL_FA_TRANSPARENT|PL_FA_NONDETERMINISTIC)
+{ return clause(A2, A3, 0, 0, IS_CLAUSE, A1, PL__ac, PL__ctx);
 }
 
 static
 PRED_IMPL("rule", va, rule, PL_FA_TRANSPARENT|PL_FA_NONDETERMINISTIC)
-{ return clause(A1, A2, A3, A4, IS_RULE, PL__ac, PL__ctx);
+{ return clause(A1, A2, A3, A4, IS_RULE, 0, PL__ac, PL__ctx);
 }
 
 
@@ -10327,6 +10354,7 @@ BeginPredDefs(comp)
   PRED_SHARE("clause",  2, clause, META|NDET|PL_FA_CREF|PL_FA_ISO)
   PRED_SHARE("clause",  3, clause, META|NDET|PL_FA_CREF)
   PRED_SHARE("$clause", 4, clause, META|NDET|PL_FA_CREF)
+  PRED_DEF("db_snapshot_clause", 3, db_snapshot_clause, META|NDET|PL_FA_CREF)
   PRED_SHARE("$rule",   2, rule,   META|NDET|PL_FA_CREF)
   PRED_SHARE("$rule",   3, rule,   META|NDET|PL_FA_CREF)
   PRED_DEF("nth_clause",  3, nth_clause, META|NDET)
