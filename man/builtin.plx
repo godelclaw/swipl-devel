@@ -4550,6 +4550,84 @@ permanent changes to the database.  Where transactions allow the global
 state to be updated atomically from one consistent state to the next, a
 snapshot allows reasoning about a consistent state.
 
+    \predicate[det]{db_snapshot}{1}{-Snapshot}
+Unify \arg{Snapshot} with a handle to the current state of the dynamic
+predicates.  Where snapshot/1 runs a goal in a frozen state, a handle
+allows a goal to obtain its answers from a frozen state one by one and
+modify the database between these answers.  The handle is used with
+db_snapshot_call/2 and db_snapshot_clause/3.  For example:
+
+\begin{code}
+?- assertz(p(a,1)), assertz(p(a,2)),
+   db_snapshot(S),
+   findall(X-Y,
+	   ( db_snapshot_call(S, p(a,X)),
+	     retract(p(a,X)),
+	     db_snapshot_call(S, p(a,Y))
+	   ),
+	   Pairs).
+Pairs = [1-1, 1-2, 2-1, 2-2].
+\end{code}
+
+The clauses that are visible in \arg{Snapshot} are not reclaimed until
+the snapshot is closed, either by db_snapshot_close/1 or because its
+handle is garbage collected.  A snapshot that is only needed while a
+goal runs is cheaper and closes itself with db_snapshot_scope/2.  A
+snapshot can only be used by the thread or engine that created it.  A
+snapshot that is created inside a transaction is the database as seen
+by this transaction, i.e., including the changes of the transaction,
+while predicates that do not take part in transactions are read in
+their current state.  It is closed if the transaction ends, if a nested
+transaction in which it was created is discarded and when transaction/3
+calls its constraint.  As snapshot/1 is a transaction that is always
+discarded, a snapshot created inside snapshot/1 is closed when
+snapshot/1 completes.
+
+    \predicate[nondet]{db_snapshot_scope}{2}{-Snapshot, :Goal}
+Call \arg{Goal} with \arg{Snapshot} bound to a handle to the current
+state of the dynamic predicates.  The snapshot exists while \arg{Goal}
+runs, i.e., until \arg{Goal} has produced its last answer, is cut or
+raises an exception.  Using \arg{Snapshot} outside \arg{Goal},
+including in another thread or engine, raises an existence error.
+Unlike db_snapshot/1, this needs no allocation and no closing, so it
+suits goals that are called often, such as a join that reads all its
+goals in the state of the call while its caller modifies the database
+between the answers:
+
+\begin{code}
+join(X, Y) :-
+    db_snapshot_scope(S, ( db_snapshot_call(S, p(X)),
+                           db_snapshot_call(S, q(X, Y)) )).
+\end{code}
+
+A snapshot that is created inside a transaction is the database as seen
+by this transaction, as for db_snapshot/1.  The continuation of a goal
+inside \arg{Goal} cannot be captured by shift/1 beyond
+db_snapshot_scope/2, and so tabled predicates that suspend across it
+raise an error; use db_snapshot/1 there.
+
+    \predicate[nondet]{db_snapshot_call}{2}{+Snapshot, :Goal}
+Call \arg{Goal}, selecting its clauses from the clauses that were
+visible when \arg{Snapshot} was created.  \arg{Goal} must be a goal on a
+dynamic predicate, not a control structure or call/N.  A goal that is
+called from the body of a selected clause sees the current database,
+unless it is called using db_snapshot_call/2 itself.  Fails silently if
+the predicate does not exist.  Raises a permission error if, when
+\arg{Goal} is called, the predicate is not dynamic or is wrapped (see
+wrap_predicate/4), or if \arg{Snapshot} was created by another thread or
+engine, and an existence error if \arg{Snapshot} is closed or is used
+outside the goal of db_snapshot_scope/2 that created it.
+
+    \predicate[nondet]{db_snapshot_clause}{3}{+Snapshot, :Head, ?Body}
+As clause/2, enumerating the clauses that were visible when
+\arg{Snapshot} was created.  Fails silently if the predicate does not
+exist.  Raises a permission error if the predicate is not dynamic.
+
+    \predicate[det]{db_snapshot_close}{1}{+Snapshot}
+Close \arg{Snapshot}, a snapshot of db_snapshot/1.  Closing a snapshot
+that is already closed has no effect.  A snapshot of db_snapshot_scope/2
+ends with its goal; closing it raises a permission error.
+
     \predicate[nondet]{current_transaction}{1}{-Goal}
 True when called inside a transaction running \arg{Goal}. This predicate
 generates candidates from the current (nested) transaction outward.

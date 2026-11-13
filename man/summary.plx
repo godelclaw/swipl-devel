@@ -209,6 +209,11 @@ suggest predicates from a keyword.
 \predicatesummary{day_of_the_week}{2}{Determine ordinal-day from date}
 \predicatesummary{date_time_stamp}{2}{Convert date structure to time-stamp}
 \predicatesummary{date_time_value}{3}{Extract info from a date structure}
+\predicatesummary{db_snapshot}{1}{Handle to the current state of the database}
+\predicatesummary{db_snapshot_call}{2}{Call dynamic predicate in a database snapshot}
+\predicatesummary{db_snapshot_clause}{3}{Get clauses in a database snapshot}
+\predicatesummary{db_snapshot_close}{1}{Close a database snapshot}
+\predicatesummary{db_snapshot_scope}{2}{Call a goal with a database snapshot}
 \predicatesummary{dcg_translate_rule}{2}{Source translation of DCG rules}
 \predicatesummary{dcg_translate_rule}{4}{Source translation of DCG rules}
 \predicatesummary{dde_current_connection}{2}{Win32: Examine open DDE connections}
